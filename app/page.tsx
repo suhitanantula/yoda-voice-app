@@ -90,7 +90,7 @@ export default function Home() {
       dc.addEventListener('open', () => {
         addLog('Data channel open');
         // Configure the session with Yoda's personality
-        dc.send(JSON.stringify({
+        const config = JSON.stringify({
           type: 'session.update',
           session: {
             modalities: ['text', 'audio'],
@@ -99,16 +99,19 @@ export default function Home() {
             input_audio_transcription: { model: 'whisper-1' },
             turn_detection: { type: 'server_vad' },
           }
-        }));
+        });
+        addLog(`Sending config: ${config.substring(0, 80)}...`);
+        dc.send(config);
         addLog('Session configured');
       });
 
       dc.addEventListener('message', (e) => {
         try {
           const msg = JSON.parse(e.data);
-          
+          addLog(`<< ${msg.type}`);  // Log ALL events
+
           if (msg.type === 'session.created' || msg.type === 'session.updated') {
-            addLog(`<< ${msg.type}`);
+            // already logged above
           }
 
           if (msg.type === 'response.audio_transcript.done') {
@@ -124,11 +127,23 @@ export default function Home() {
             setIsTalking(false);
           }
 
+          if (msg.type === 'input_audio_buffer.speech_started') {
+            addLog('🎤 Speech detected');
+            setIsTalking(true);
+          }
+
+          if (msg.type === 'input_audio_buffer.speech_stopped') {
+            addLog('🎤 Speech ended');
+            setIsTalking(false);
+          }
+
           if (msg.type === 'error') {
             addLog(`Error: ${JSON.stringify(msg.error)}`);
             setIsTalking(false);
           }
-        } catch {}
+        } catch (err) {
+          addLog(`Parse error: ${err}`);
+        }
       });
 
       // 3. Create SDP offer and exchange with OpenAI
