@@ -68,16 +68,17 @@ export default function Home() {
       addLog('Session ready');
 
       // 2. Connect to OpenAI Realtime WebSocket
+      // Auth goes in the URL as a query param, not as a message
       const model = 'gpt-4o-realtime-preview-2025-06-20';
+      const encodedToken = encodeURIComponent(clientSecret);
       const ws = new WebSocket(
-        `wss://api.openai.com/v1/realtime?model=${model}`,
+        `wss://api.openai.com/v1/realtime?model=${model}&authorization=Bearer%20${encodedToken}`,
         ['realtime']
       );
       wsRef.current = ws;
 
       ws.onopen = () => {
-        addLog('Connected — authenticating');
-        ws.send(JSON.stringify({ type: 'auth', data: { authorization: clientSecret } }));
+        addLog('Connected');
       };
 
       ws.onmessage = async (e) => {
