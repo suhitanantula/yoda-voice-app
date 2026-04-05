@@ -7,11 +7,11 @@ export async function POST() {
   try {
     // Create an ephemeral key for the browser to use
     // This keeps the main API key server-side
-    const token = await openai.realtime.createEphemeralSession({
+    const session = await openai.beta.realtime.sessions.create({
       model: 'gpt-4o-realtime-preview-2025-06-20',
     });
 
-    return NextResponse.json({ clientSecret: token.data.client_secret });
+    return NextResponse.json({ clientSecret: session.client_secret.value });
   } catch (err: any) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
