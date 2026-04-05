@@ -81,11 +81,14 @@ export default function Home() {
       addLog('Token acquired ✅');
 
       // 2. Set up audio context and microphone
-      const ctx = new AudioContext({ sampleRate: 24000 });
+      // Don't force sampleRate — browsers may ignore it. Detect actual rate.
+      const ctx = new AudioContext();
       audioCtxRef.current = ctx;
+      const actualSampleRate = ctx.sampleRate;
+      addLog(`AudioContext sample rate: ${actualSampleRate}Hz`);
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { sampleRate: 24000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
       });
       streamRef.current = stream;
       addLog('Mic connected ✅');
@@ -102,13 +105,36 @@ export default function Home() {
       const processor = ctx.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
 
+      const TARGET_RATE = 24000;
+      const needsResample = actualSampleRate !== TARGET_RATE;
+      let resampler: any = null;
+      if (needsResample) {
+        // Manual linear resample to 24000Hz
+        resampler = (input: Float32Array) => {
+          const ratio = actualSampleRate / TARGET_RATE;
+          const outLen = Math.round(input.length / ratio);
+          const out = new Float32Array(outLen);
+          for (let i = 0; i < outLen; i++) {
+            const srcIdx = i * ratio;
+            const idx = Math.floor(srcIdx);
+            const frac = srcIdx - idx;
+            out[i] = idx + 1 < input.length
+              ? input[idx] * (1 - frac) + input[idx + 1] * frac
+              : input[idx];
+          }
+          return out;
+        };
+        addLog(`Resampling ${actualSampleRate}Hz → ${TARGET_RATE}Hz`);
+      }
+
       processor.onaudioprocess = (e) => {
         if (ws.readyState !== WebSocket.OPEN) return;
         const inputData = e.inputBuffer.getChannelData(0);
+        const pcmData = needsResample ? resampler(inputData) : inputData;
         // Convert float32 → PCM16 → base64
-        const pcm16 = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          const s = Math.max(-1, Math.min(1, inputData[i]));
+        const pcm16 = new Int16Array(pcmData.length);
+        for (let i = 0; i < pcmData.length; i++) {
+          const s = Math.max(-1, Math.min(1, pcmData[i]));
           pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
         const bytes = new Uint8Array(pcm16.buffer);
@@ -123,6 +149,10 @@ export default function Home() {
           audio: base64,
         }));
       };
+
+      if (!needsResample) {
+        addLog('Native sample rate matches 24kHz — no resampling needed');
+      }
 
       source.connect(processor);
       processor.connect(ctx.destination);
