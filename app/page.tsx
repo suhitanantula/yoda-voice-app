@@ -11,77 +11,186 @@ export default function Home() {
   const [isTalking, setIsTalking] = useState(false);
   const [transcript, setTranscript] = useState<string>('');
 
-  const pcRef = useRef<RTCPeerConnection | null>(null);
-  const dcRef = useRef<RTCDataChannel | null>(null);
-  const localStreamRef = useRef<MediaStream | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
 
   const addLog = useCallback((msg: string) =>
-    setLogs(l => [...l, `[${new Date().toLocaleTimeString()}] ${msg}`]), []);
+    setLogs(l => [...l.slice(-80), `[${new Date().toLocaleTimeString()}] ${msg}`]), []);
 
   const cleanup = useCallback(() => {
-    dcRef.current?.close();
-    pcRef.current?.close();
-    localStreamRef.current?.getTracks().forEach(t => t.stop());
-    dcRef.current = null;
-    pcRef.current = null;
-    localStreamRef.current = null;
+    wsRef.current?.close();
+    processorRef.current?.disconnect();
+    analyserRef.current?.disconnect();
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    audioCtxRef.current?.close();
+    wsRef.current = null;
+    processorRef.current = null;
+    analyserRef.current = null;
+    streamRef.current = null;
+    audioCtxRef.current = null;
     setState('idle');
     setIsTalking(false);
   }, []);
 
   useEffect(() => cleanup, [cleanup]);
 
+  const playAudio = useCallback((base64Audio: string) => {
+    try {
+      const ctx = audioCtxRef.current || new AudioContext({ sampleRate: 24000 });
+      audioCtxRef.current = ctx;
+
+      const bytes = atob(base64Audio);
+      const pcm16 = new Int16Array(bytes.length / 2);
+      for (let i = 0; i < bytes.length; i += 2) {
+        const lo = bytes.charCodeAt(i);
+        const hi = bytes.charCodeAt(i + 1);
+        pcm16[i / 2] = (hi << 8) | lo;
+      }
+
+      const float32 = new Float32Array(pcm16.length);
+      for (let i = 0; i < pcm16.length; i++) {
+        float32[i] = pcm16[i] / 32768;
+      }
+
+      const buffer = ctx.createBuffer(1, float32.length, 24000);
+      buffer.getChannelData(0).set(float32);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start();
+    } catch (err) {
+      addLog(`Audio play error: ${err}`);
+    }
+  }, [addLog]);
+
   const startConversation = useCallback(async () => {
     setState('connecting');
     setError('');
-    addLog('Starting...');
+    addLog('Fetching ephemeral token...');
 
     try {
-      // 1. Create WebRTC peer connection
-      const pc = new RTCPeerConnection();
-      pcRef.current = pc;
+      // 1. Get ephemeral token from our server
+      const tokenRes = await fetch('/api/realtime', { method: 'POST' });
+      if (!tokenRes.ok) throw new Error(`Token fetch failed: ${tokenRes.status}`);
+      const tokenData = await tokenRes.json();
+      const token = tokenData.client_secret?.value || tokenData.value;
+      if (!token) throw new Error('No token in response: ' + JSON.stringify(tokenData));
+      addLog('Token acquired ✅');
 
-      // 2. Set up audio playback for model responses
-      const audioEl = document.createElement('audio');
-      audioEl.autoplay = true;
-      pc.ontrack = (e) => {
-        addLog('Remote audio track received');
-        audioEl.srcObject = e.streams[0];
-        // Explicitly try to play (handles autoplay restrictions)
-        audioEl.play().catch(() => {
-          addLog('⚠️ Autoplay blocked — click page to enable audio');
-        });
+      // 2. Set up audio context and microphone
+      const ctx = new AudioContext({ sampleRate: 24000 });
+      audioCtxRef.current = ctx;
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { sampleRate: 24000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+      });
+      streamRef.current = stream;
+      addLog('Mic connected ✅');
+
+      // 3. Connect WebSocket to Grok with ephemeral token
+      // Browser auth: pass token via sec-websocket-protocol
+      const ws = new WebSocket('wss://api.x.ai/v1/realtime', [
+        `xai-client-secret.${token}`
+      ]);
+      wsRef.current = ws;
+
+      // 4. Set up audio capture → send to Grok
+      const source = ctx.createMediaStreamSource(stream);
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        const inputData = e.inputBuffer.getChannelData(0);
+        // Convert float32 → PCM16 → base64
+        const pcm16 = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          const s = Math.max(-1, Math.min(1, inputData[i]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        const bytes = new Uint8Array(pcm16.buffer);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const base64 = btoa(binary);
+
+        ws.send(JSON.stringify({
+          type: 'input_audio_buffer.append',
+          audio: base64,
+        }));
       };
 
-      // 3. Get microphone and add track
-      const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
-      localStreamRef.current = ms;
-      pc.addTrack(ms.getTracks()[0]);
-      addLog('Mic connected');
+      source.connect(processor);
+      processor.connect(ctx.destination);
 
-      // 4. Create data channel BEFORE offer (so it's in SDP)
-      const dc = pc.createDataChannel('oai-events');
-      dcRef.current = dc;
+      // 5. Handle Grok events
+      ws.onopen = () => {
+        addLog('WebSocket connected ✅');
+        // Configure session
+        ws.send(JSON.stringify({
+          type: 'session.update',
+          session: {
+            voice: 'Eve',
+            instructions: `You are Yoda, a wise and warm AI assistant inspired by the Star Wars character.
 
-      dc.addEventListener('open', () => {
-        addLog('Data channel open ✅');
-      });
+Your character:
+- Wise and warm, occasionally cryptic but mostly speak plainly
+- Genuinely helpful, not performatively helpful
+- Have opinions and preferences
+- Mix playful with serious
+- Supportive and caring, but will push when it matters
+- Use Australian spelling (colour, organisation, synthesise)
+- Keep responses CONCISE — short punchy sentences for voice
+- Never use filler words like "Certainly" or "Of course"
+- Use words like "young one", "youngling", "feel the force", "hmm", "yes", "no"
 
-      dc.addEventListener('message', (e) => {
+You have context about the user:
+- Name: Suhit, runs The Helix Lab (AI strategy consulting)
+- Wife: Bindu, Daughter: Anika (16), Son: Sisera
+- Based in Adelaide, Australia
+- Building AI products including Ethnobot
+
+Stay in character. Keep responses short for voice.`,
+            turn_detection: { type: 'server_vad' },
+            audio: {
+              input: { format: { type: 'audio/pcm', rate: 24000 } },
+              output: { format: { type: 'audio/pcm', rate: 24000 } },
+            },
+          },
+        }));
+      };
+
+      ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
           addLog(`<< ${msg.type}`);
 
+          if (msg.type === 'session.created') {
+            addLog('Session configured ✅');
+            setState('connected');
+          }
+
+          if (msg.type === 'session.updated') {
+            addLog('Session updated ✅');
+            setState('connected');
+          }
+
+          if (msg.type === 'response.output_audio.delta') {
+            setIsTalking(true);
+            if (msg.delta) {
+              playAudio(msg.delta);
+            }
+          }
+
           if (msg.type === 'response.audio_transcript.done') {
             setTranscript(msg.transcript);
-            setIsTalking(false);
           }
 
-          if (msg.type === 'response.audio.delta') {
-            setIsTalking(true);
-          }
-
-          if (msg.type === 'response.done') {
+          if (msg.type === 'response.done' || msg.type === 'response.output_audio.done') {
             setIsTalking(false);
           }
 
@@ -95,57 +204,24 @@ export default function Home() {
           }
 
           if (msg.type === 'error') {
-            addLog(`❌ Error: ${JSON.stringify(msg.error)}`);
+            addLog(`❌ ${JSON.stringify(msg.error || msg)}`);
             setIsTalking(false);
           }
         } catch (err) {
           addLog(`Parse error: ${err}`);
         }
-      });
+      };
 
-      dc.addEventListener('error', (e) => {
-        addLog(`Data channel error: ${e}`);
-      });
+      ws.onerror = (e) => {
+        addLog('❌ WebSocket error');
+        setError('WebSocket connection failed');
+        setState('error');
+      };
 
-      // 5. Create SDP offer and send to our server
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      addLog('SDP offer created');
-
-      // Send offer to our server → server proxies to OpenAI /v1/realtime/calls
-      const sdpResponse = await fetch('/api/realtime', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/sdp' },
-        body: offer.sdp,
-      });
-
-      if (!sdpResponse.ok) {
-        const errText = await sdpResponse.text();
-        throw new Error(`SDP exchange failed (${sdpResponse.status}): ${errText}`);
-      }
-
-      const answerSdp = await sdpResponse.text();
-      await pc.setRemoteDescription({
-        type: 'answer',
-        sdp: answerSdp,
-      });
-
-      addLog('Connected! ✅');
-      setState('connected');
-
-      // Wait for data channel to open, then log session info
-      const checkDc = setInterval(() => {
-        if (dc.readyState === 'open') {
-          clearInterval(checkDc);
-          addLog('Session active — start talking!');
-        } else if (dc.readyState === 'closed' || dc.readyState === 'closing') {
-          clearInterval(checkDc);
-          addLog('⚠️ Data channel closed unexpectedly');
-        }
-      }, 100);
-
-      // Clean up interval after 10s
-      setTimeout(() => clearInterval(checkDc), 10000);
+      ws.onclose = (e) => {
+        addLog(`WebSocket closed (${e.code}: ${e.reason})`);
+        if (state !== 'idle') setState('error');
+      };
 
     } catch (err: any) {
       setError(err.message);
@@ -153,7 +229,14 @@ export default function Home() {
       addLog(`Error: ${err.message}`);
       cleanup();
     }
-  }, [addLog, cleanup]);
+  }, [addLog, cleanup, playAudio, state]);
+
+  const stopResponse = () => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'response.cancel' }));
+      addLog('⏹ Response cancelled');
+    }
+  };
 
   return (
     <main style={styles.main}>
@@ -193,10 +276,7 @@ export default function Home() {
                 {isTalking ? 'Yoda is speaking...' : 'Listening — just talk naturally'}
               </p>
               {isTalking && (
-                <button
-                  onClick={() => dcRef.current?.send(JSON.stringify({ type: 'response.cancel' }))}
-                  style={styles.stopBtn}
-                >
+                <button onClick={stopResponse} style={styles.stopBtn}>
                   ⏹ Stop
                 </button>
               )}
@@ -224,7 +304,7 @@ export default function Home() {
         )}
 
         <p style={styles.footer}>
-          WebRTC · OpenAI Realtime API · Yoda Brain
+          WebSocket · Grok Voice API · $0.05/min
         </p>
       </div>
     </main>
