@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "next dev --turbopack",
-    "build": "NEXT_DISABLE_TURBOPACK=1 next build",
+    "dev": "next dev",
+    "build": "next build --no-turbopack",
     "start": "next start"
   },
   "dependencies": {
