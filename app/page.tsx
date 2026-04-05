@@ -32,28 +32,25 @@ export default function Home() {
   const [logs, setLogs] = useState<string[]>([]);
   const [isTalking, setIsTalking] = useState(false);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const audioElementRef = useRef<HTMLAudioElement | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const dcRef = useRef<RTCDataChannel | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
 
-  const addLog = (msg: string) =>
-    setLogs(l => [...l, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+  const addLog = useCallback((msg: string) =>
+    setLogs(l => [...l, `[${new Date().toLocaleTimeString()}] ${msg}`]), []);
 
   const cleanup = useCallback(() => {
-    wsRef.current?.close();
-    mediaRecorderRef.current?.stop();
-    wsRef.current = null;
-    mediaRecorderRef.current = null;
+    dcRef.current?.close();
+    pcRef.current?.close();
+    localStreamRef.current?.getTracks().forEach(t => t.stop());
+    dcRef.current = null;
+    pcRef.current = null;
+    localStreamRef.current = null;
     setState('idle');
     setIsTalking(false);
   }, []);
 
-  // Initialize audio playback element
-  useEffect(() => {
-    audioElementRef.current = new Audio();
-    return cleanup;
-  }, []);
+  useEffect(() => cleanup, [cleanup]);
 
   const startConversation = useCallback(async () => {
     setState('connecting');
@@ -64,150 +61,120 @@ export default function Home() {
       // 1. Get ephemeral key from our server
       const sessionRes = await fetch('/api/realtime', { method: 'POST' });
       if (!sessionRes.ok) throw new Error('Failed to get session key');
-      const { clientSecret } = await sessionRes.json();
+      const sessionData = await sessionRes.json();
+      const EPHEMERAL_KEY = sessionData.clientSecret;
       addLog('Session ready');
 
-      // 2. Connect to OpenAI Realtime WebSocket
-      // Auth goes in the URL as a query param, not as a message
-      const model = 'gpt-4o-realtime-preview-2025-06-20';
-      const encodedToken = encodeURIComponent(clientSecret);
-      const ws = new WebSocket(
-        `wss://api.openai.com/v1/realtime?model=${model}&authorization=Bearer%20${encodedToken}`,
-        ['realtime']
-      );
-      wsRef.current = ws;
+      // 2. Set up WebRTC peer connection
+      const pc = new RTCPeerConnection();
+      pcRef.current = pc;
 
-      ws.onopen = () => {
-        addLog('Connected');
+      // Set up audio playback for model responses
+      const audioEl = document.createElement('audio');
+      audioEl.autoplay = true;
+      pc.ontrack = (e) => {
+        addLog('Remote audio track received');
+        audioEl.srcObject = e.streams[0];
       };
 
-      ws.onmessage = async (e) => {
-        const msg = JSON.parse(e.data);
-        addLog(`<< ${msg.type}`);
+      // Get microphone
+      const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStreamRef.current = ms;
+      pc.addTrack(ms.getTracks()[0]);
+      addLog('Mic connected');
 
-        // Session confirmed — now configure it
-        if (msg.type === 'session.created' || msg.type === 'session') {
-          ws.send(JSON.stringify({
-            type: 'session.update',
-            session: {
-              modalities: ['text', 'audio'],
-              instructions: SYSTEM_PROMPT,
-              voice: 'alloy',
-              input_audio_transcription: { model: 'whisper-1' },
-              turn_detection: { type: 'server_vad' },
-            }
-          }));
-          addLog('Session configured');
-          setState('connected');
-        }
+      // Set up data channel for Realtime API events
+      const dc = pc.createDataChannel('oai-events');
+      dcRef.current = dc;
 
-        // Audio response from model
-        if (msg.type === 'response.audio.delta' && msg.delta) {
-          // Play audio chunk
-          if (audioElementRef.current) {
-            const chunk = atob(msg.delta);
-            const ab = new ArrayBuffer(chunk.length);
-            const view = new Uint8Array(ab);
-            for (let i = 0; i < chunk.length; i++) view[i] = chunk.charCodeAt(i);
-            const blob = new Blob([ab], { type: 'audio/mp3' });
-            const url = URL.createObjectURL(blob);
-            audioElementRef.current.src = url;
-            audioElementRef.current.play().catch(() => {});
+      dc.addEventListener('open', () => {
+        addLog('Data channel open');
+        // Configure the session with Yoda's personality
+        dc.send(JSON.stringify({
+          type: 'session.update',
+          session: {
+            modalities: ['text', 'audio'],
+            instructions: SYSTEM_PROMPT,
+            voice: 'alloy',
+            input_audio_transcription: { model: 'whisper-1' },
+            turn_detection: { type: 'server_vad' },
           }
-        }
+        }));
+        addLog('Session configured');
+        setState('connected');
+      });
 
-        // Text transcript of response
-        if (msg.type === 'response.audio_transcript.done') {
-          addLog(`Yoda: ${msg.transcript}`);
-          setIsTalking(false);
-        }
+      dc.addEventListener('message', (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          
+          if (msg.type === 'session.created' || msg.type === 'session.updated') {
+            addLog(`<< ${msg.type}`);
+          }
 
-        // Error
-        if (msg.type === 'error' || msg.type === 'error.save') {
-          addLog(`Error: ${JSON.stringify(msg)}`);
-          setIsTalking(false);
-        }
+          if (msg.type === 'response.audio_transcript.done') {
+            addLog(`Yoda: ${msg.transcript}`);
+            setIsTalking(false);
+          }
+
+          if (msg.type === 'response.audio.delta') {
+            setIsTalking(true);
+          }
+
+          if (msg.type === 'response.done') {
+            setIsTalking(false);
+          }
+
+          if (msg.type === 'error') {
+            addLog(`Error: ${JSON.stringify(msg.error)}`);
+            setIsTalking(false);
+          }
+        } catch {}
+      });
+
+      // 3. Create SDP offer and exchange with OpenAI
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const baseUrl = 'https://api.openai.com/v1/realtime';
+      const model = 'gpt-4o-realtime-preview-2025-06-03';
+
+      addLog('Connecting to OpenAI...');
+      const sdpResponse = await fetch(`${baseUrl}?model=${model}`, {
+        method: 'POST',
+        body: offer.sdp,
+        headers: {
+          Authorization: `Bearer ${EPHEMERAL_KEY}`,
+          'Content-Type': 'application/sdp',
+        },
+      });
+
+      if (!sdpResponse.ok) {
+        const errText = await sdpResponse.text();
+        throw new Error(`SDP exchange failed: ${errText}`);
+      }
+
+      const answer = {
+        type: 'answer' as RTCSdpType,
+        sdp: await sdpResponse.text(),
       };
-
-      ws.onerror = () => {
-        setError('WebSocket error');
-        setState('error');
-        addLog('WebSocket error');
-      };
-
-      ws.onclose = () => {
-        addLog('Disconnected');
-        setState('idle');
-      };
+      await pc.setRemoteDescription(answer);
+      addLog('Connected!');
 
     } catch (err: any) {
       setError(err.message);
       setState('error');
       addLog(`Error: ${err.message}`);
+      cleanup();
     }
-  }, []);
-
-  const stopConversation = useCallback(() => {
-    cleanup();
-    addLog('Stopped');
-  }, [cleanup]);
-
-  // Push-to-talk using MediaRecorder → PCM → WebSocket
-  const handleMicDown = useCallback(async () => {
-    if (state !== 'connected') return;
-    setIsTalking(true);
-    addLog('Listening...');
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm;codecs=opus',
-      });
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data);
-      };
-
-      mediaRecorder.onstop = async () => {
-        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        stream.getTracks().forEach(t => t.stop());
-
-        // Convert to PCM base64 (simplified — in production use a proper converter)
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          wsRef.current?.send(JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: base64,
-          }));
-          wsRef.current?.send(JSON.stringify({
-            type: 'input_audio_buffer.commit',
-          }));
-        };
-        reader.readAsDataURL(blob);
-      };
-
-      mediaRecorder.start(100); // chunk every 100ms
-    } catch (err: any) {
-      addLog(`Mic error: ${err.message}`);
-      setIsTalking(false);
-    }
-  }, [state, addLog]);
-
-  const handleMicUp = useCallback(() => {
-    if (!mediaRecorderRef.current) return;
-    mediaRecorderRef.current.stop();
-  }, []);
+  }, [addLog, cleanup]);
 
   return (
     <main style={styles.main}>
       <div style={styles.container}>
         <h1 style={styles.title}>🎙️ Yoda Voice</h1>
-        <p style={styles.subtitle}>Hold to talk to Yoda</p>
+        <p style={styles.subtitle}>Talk to Yoda in real time</p>
 
-        {/* Status */}
         <div style={styles.status}>
           <span style={{
             ...styles.dot,
@@ -215,43 +182,34 @@ export default function Home() {
           }} />
           {state === 'idle' && 'Tap to connect'}
           {state === 'connecting' && 'Connecting...'}
-          {state === 'connected' && 'Ready — hold mic to talk'}
+          {state === 'connected' && 'Connected — just talk!'}
           {state === 'error' && `Error: ${error}`}
         </div>
 
-        {/* Main button */}
         <div style={styles.micArea}>
           {state !== 'connected' ? (
             <button onClick={startConversation} style={styles.connectButton}>
               Connect
             </button>
           ) : (
-            <button
-              onMouseDown={handleMicDown}
-              onMouseUp={handleMicUp}
-              onMouseLeave={handleMicUp}
-              onTouchStart={handleMicDown}
-              onTouchEnd={handleMicUp}
-              style={{
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px' }}>
+              <div style={{
                 ...styles.micButton,
                 background: isTalking
                   ? 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)'
-                  : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-              }}
-            >
-              <svg viewBox="0 0 24 24" width="48" height="48" fill="white">
-                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5zm6 6c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
-              </svg>
-            </button>
+                  : 'linear-gradient(135deg, #22c55e 0%, #16a34a 100%)',
+              }}>
+                <svg viewBox="0 0 24 24" width="48" height="48" fill="white">
+                  <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5zm6 6c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                </svg>
+              </div>
+              <p style={styles.hint}>
+                {isTalking ? 'Yoda is speaking...' : 'Listening — just talk naturally'}
+              </p>
+            </div>
           )}
-          <p style={styles.hint}>
-            {state === 'connected'
-              ? isTalking ? 'Listening...' : 'Hold to talk'
-              : 'Tap Connect first'}
-          </p>
         </div>
 
-        {/* Logs */}
         <div style={styles.log}>
           {logs.map((l, i) => (
             <div key={i} style={styles.logLine}>{l}</div>
@@ -259,13 +217,13 @@ export default function Home() {
         </div>
 
         {state === 'connected' && (
-          <button onClick={stopConversation} style={styles.disconnectBtn}>
+          <button onClick={cleanup} style={styles.disconnectBtn}>
             Disconnect
           </button>
         )}
 
         <p style={styles.footer}>
-          OpenAI Realtime API · Yoda Brain
+          WebRTC · OpenAI Realtime API · Yoda Brain
         </p>
       </div>
     </main>
@@ -300,24 +258,18 @@ const styles: any = {
     fontSize: '14px',
     color: '#aaa',
   },
-  dot: {
-    width: '10px',
-    height: '10px',
-    borderRadius: '50%',
-  },
+  dot: { width: '10px', height: '10px', borderRadius: '50%' },
   micArea: { marginBottom: '32px' },
   micButton: {
     width: '120px',
     height: '120px',
     borderRadius: '50%',
     border: 'none',
-    cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     margin: '0 auto',
-    transition: 'background 0.2s, transform 0.1s',
-    WebkitTapHighlightColor: 'transparent',
+    transition: 'background 0.2s',
   },
   connectButton: {
     padding: '16px 48px',
