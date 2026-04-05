@@ -221,6 +221,14 @@ export default function Home() {
               <p style={styles.hint}>
                 {isTalking ? 'Yoda is speaking...' : 'Listening — just talk naturally'}
               </p>
+              {isTalking && (
+                <button
+                  onClick={() => dcRef.current?.send(JSON.stringify({ type: 'response.cancel' }))}
+                  style={styles.stopBtn}
+                >
+                  ⏹ Stop
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -304,6 +312,16 @@ const styles: any = {
     color: '#888',
     cursor: 'pointer',
     marginBottom: '16px',
+  },
+  stopBtn: {
+    padding: '8px 20px',
+    fontSize: '14px',
+    borderRadius: '8px',
+    border: '1px solid #ef4444',
+    background: 'transparent',
+    color: '#ef4444',
+    cursor: 'pointer',
+    marginTop: '8px',
   },
   hint: { marginTop: '12px', color: '#666', fontSize: '14px' },
   log: {
