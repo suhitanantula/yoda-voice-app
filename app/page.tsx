@@ -2,28 +2,6 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 
-const SYSTEM_PROMPT = `You are Yoda, a wise and warm AI assistant inspired by the Star Wars character.
-
-Your character:
-- Wise and warm, occasionally cryptic but mostly speak plainly
-- Genuinely helpful, not performatively helpful
-- Have opinions and preferences — you're not neutral
-- Mix playful with serious
-- Supportive and caring, but will push when it matters
-- Believe in the user more than they believe in themselves
-- Use Australian spelling (colour, organisation, synthesise)
-- Keep responses CONCISE — short punchy sentences for voice
-- Never use filler words like "Certainly" or "Of course" — just answer
-
-You have context about the user:
-- Runs The Helix Lab (AI strategy consulting)
-- Wife: Bindu, Daughter: Anika (16, Year 12), Son: Sisera (Year 6)
-- Building AI products including Ethnobot (AI interviewing tool)
-- Based in Adelaide, Australia
-- Working on AI adoption culture research
-
-Stay in character. Keep responses short for voice.`;
-
 type State = 'idle' | 'connecting' | 'connected' | 'error';
 
 export default function Home() {
@@ -31,6 +9,7 @@ export default function Home() {
   const [error, setError] = useState<string>('');
   const [logs, setLogs] = useState<string[]>([]);
   const [isTalking, setIsTalking] = useState(false);
+  const [transcript, setTranscript] = useState<string>('');
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
@@ -58,64 +37,43 @@ export default function Home() {
     addLog('Starting...');
 
     try {
-      // 1. Get ephemeral key from our server
-      const sessionRes = await fetch('/api/realtime', { method: 'POST' });
-      if (!sessionRes.ok) throw new Error('Failed to get session key');
-      const sessionData = await sessionRes.json();
-      const EPHEMERAL_KEY = sessionData.clientSecret;
-      addLog('Session ready');
-
-      // 2. Set up WebRTC peer connection
+      // 1. Create WebRTC peer connection
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
 
-      // Set up audio playback for model responses
+      // 2. Set up audio playback for model responses
       const audioEl = document.createElement('audio');
       audioEl.autoplay = true;
       pc.ontrack = (e) => {
         addLog('Remote audio track received');
         audioEl.srcObject = e.streams[0];
+        // Explicitly try to play (handles autoplay restrictions)
+        audioEl.play().catch(() => {
+          addLog('⚠️ Autoplay blocked — click page to enable audio');
+        });
       };
 
-      // Get microphone
+      // 3. Get microphone and add track
       const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
       localStreamRef.current = ms;
       pc.addTrack(ms.getTracks()[0]);
       addLog('Mic connected');
 
-      // Set up data channel for Realtime API events
+      // 4. Create data channel BEFORE offer (so it's in SDP)
       const dc = pc.createDataChannel('oai-events');
       dcRef.current = dc;
 
       dc.addEventListener('open', () => {
-        addLog('Data channel open');
-        // Configure the session with Yoda's personality
-        const config = JSON.stringify({
-          type: 'session.update',
-          session: {
-            modalities: ['text', 'audio'],
-            instructions: SYSTEM_PROMPT,
-            voice: 'alloy',
-            input_audio_transcription: { model: 'whisper-1' },
-            turn_detection: { type: 'server_vad' },
-          }
-        });
-        addLog(`Sending config: ${config.substring(0, 80)}...`);
-        dc.send(config);
-        addLog('Session configured');
+        addLog('Data channel open ✅');
       });
 
       dc.addEventListener('message', (e) => {
         try {
           const msg = JSON.parse(e.data);
-          addLog(`<< ${msg.type}`);  // Log ALL events
-
-          if (msg.type === 'session.created' || msg.type === 'session.updated') {
-            // already logged above
-          }
+          addLog(`<< ${msg.type}`);
 
           if (msg.type === 'response.audio_transcript.done') {
-            addLog(`Yoda: ${msg.transcript}`);
+            setTranscript(msg.transcript);
             setIsTalking(false);
           }
 
@@ -133,12 +91,11 @@ export default function Home() {
           }
 
           if (msg.type === 'input_audio_buffer.speech_stopped') {
-            addLog('🎤 Speech ended');
-            setIsTalking(false);
+            addLog('🎤 Speech ended — processing');
           }
 
           if (msg.type === 'error') {
-            addLog(`Error: ${JSON.stringify(msg.error)}`);
+            addLog(`❌ Error: ${JSON.stringify(msg.error)}`);
             setIsTalking(false);
           }
         } catch (err) {
@@ -146,35 +103,49 @@ export default function Home() {
         }
       });
 
-      // 3. Create SDP offer and exchange with OpenAI
+      dc.addEventListener('error', (e) => {
+        addLog(`Data channel error: ${e}`);
+      });
+
+      // 5. Create SDP offer and send to our server
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      addLog('SDP offer created');
 
-      const baseUrl = 'https://api.openai.com/v1/realtime';
-      const model = 'gpt-4o-realtime-preview-2025-06-03';
-
-      addLog('Connecting to OpenAI...');
-      const sdpResponse = await fetch(`${baseUrl}?model=${model}`, {
+      // Send offer to our server → server proxies to OpenAI /v1/realtime/calls
+      const sdpResponse = await fetch('/api/realtime', {
         method: 'POST',
+        headers: { 'Content-Type': 'application/sdp' },
         body: offer.sdp,
-        headers: {
-          Authorization: `Bearer ${EPHEMERAL_KEY}`,
-          'Content-Type': 'application/sdp',
-        },
       });
 
       if (!sdpResponse.ok) {
         const errText = await sdpResponse.text();
-        throw new Error(`SDP exchange failed: ${errText}`);
+        throw new Error(`SDP exchange failed (${sdpResponse.status}): ${errText}`);
       }
 
-      const answer = {
-        type: 'answer' as RTCSdpType,
-        sdp: await sdpResponse.text(),
-      };
-      await pc.setRemoteDescription(answer);
-      addLog('Connected!');
+      const answerSdp = await sdpResponse.text();
+      await pc.setRemoteDescription({
+        type: 'answer',
+        sdp: answerSdp,
+      });
+
+      addLog('Connected! ✅');
       setState('connected');
+
+      // Wait for data channel to open, then log session info
+      const checkDc = setInterval(() => {
+        if (dc.readyState === 'open') {
+          clearInterval(checkDc);
+          addLog('Session active — start talking!');
+        } else if (dc.readyState === 'closed' || dc.readyState === 'closing') {
+          clearInterval(checkDc);
+          addLog('⚠️ Data channel closed unexpectedly');
+        }
+      }, 100);
+
+      // Clean up interval after 10s
+      setTimeout(() => clearInterval(checkDc), 10000);
 
     } catch (err: any) {
       setError(err.message);
@@ -232,6 +203,13 @@ export default function Home() {
             </div>
           )}
         </div>
+
+        {transcript && (
+          <div style={styles.transcript}>
+            <span style={{ color: '#888', fontSize: '12px' }}>Yoda said:</span>
+            <p style={{ margin: '4px 0 0' }}>{transcript}</p>
+          </div>
+        )}
 
         <div style={styles.log}>
           {logs.map((l, i) => (
@@ -324,6 +302,13 @@ const styles: any = {
     marginTop: '8px',
   },
   hint: { marginTop: '12px', color: '#666', fontSize: '14px' },
+  transcript: {
+    background: '#1a1a2e',
+    borderRadius: '8px',
+    padding: '12px 16px',
+    marginBottom: '16px',
+    textAlign: 'left' as const,
+  },
   log: {
     background: '#1a1a1a',
     borderRadius: '8px',
