@@ -39,3 +39,4 @@ Add your `OPENAI_API_KEY` environment variable in the Vercel dashboard.
 ## Note on Browsers
 
 Works best on Chrome/Edge. Safari support for WebRTC audio can be inconsistent.
+
