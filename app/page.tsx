@@ -101,7 +101,6 @@ export default function Home() {
           }
         }));
         addLog('Session configured');
-        setState('connected');
       });
 
       dc.addEventListener('message', (e) => {
@@ -160,6 +159,7 @@ export default function Home() {
       };
       await pc.setRemoteDescription(answer);
       addLog('Connected!');
+      setState('connected');
 
     } catch (err: any) {
       setError(err.message);
