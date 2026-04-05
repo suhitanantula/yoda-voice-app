@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 
 const SESSION_CONFIG = JSON.stringify({
   type: "realtime",
-  model: "gpt-4o-realtime-preview-2025-06-03",
+  model: "gpt-realtime",
   audio: {
     output: { voice: "alloy" },
   },
